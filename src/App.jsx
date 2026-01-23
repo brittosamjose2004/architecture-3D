@@ -8,6 +8,7 @@ import { clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import Tilt from 'react-parallax-tilt';
 import Scene3D from './components/Scene3D';
+import ModelViewer from './components/ModelViewer';
 
 function cn(...inputs) {
   return twMerge(clsx(inputs));
@@ -84,7 +85,7 @@ const App = () => {
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState('');
   const [generatedImage, setGeneratedImage] = useState(null);
-  const [apiUrl, setApiUrl] = useState('https://brittosamjoe--vastu-plan-backend-fastapi-app.modal.run');
+  const [apiUrl, setApiUrl] = useState('https://kevin06055--vastu-plan-3d-pro-fastapi-app-entry.modal.run');
   const [hfToken, setHfToken] = useState('');
   const [activeTab, setActiveTab] = useState('site');
 
@@ -96,8 +97,22 @@ const App = () => {
     kitchen_corner: true, master_corner: true,
     bhk: '2 BHK', family_type: 'Nuclear Family', dining_style: 'Central Heart (Connecting Kitchen/Living)',
     has_utility: true, has_veranda: true, style: 'Modern Indian',
-    mode: 'Text Only', ref_image: null, steps: 25, guidance: 3.5
+    mode: 'Text Only', ref_image: null, steps: 25, guidance: 3.5,
+    // 3D Params
+    resolution: 1024, decimation: 300000, seed: 0, randomize_seed: true,
+    ss_sampling_steps: 12, ss_guidance_strength: 7.5, ss_guidance_rescale: 0.7, ss_rescale_t: 5.0,
+    shape_slat_sampling_steps: 12, shape_slat_guidance_strength: 7.5, shape_slat_guidance_rescale: 0.5, shape_slat_rescale_t: 3.0,
+    tex_slat_sampling_steps: 12, tex_slat_guidance_strength: 1.0, tex_slat_guidance_rescale: 0.0, tex_slat_rescale_t: 3.0
   });
+
+  // 3D State
+  const [renderMode, setRenderMode] = useState('normal'); // 'normal' | 'clay' | 'wireframe'
+  const [scrubberIndex, setScrubberIndex] = useState(0);
+  const [previews, setPreviews] = useState([]);
+  const [metadata, setMetadata] = useState(null);
+  const [glbData, setGlbData] = useState(null); // Base64 GLB model data
+  const [viewMode, setViewMode] = useState('2d'); // '2d' | '3d' - toggle between preview images and interactive 3D
+  const [modelColor, setModelColor] = useState('#7799bb'); // Model color for customization
 
   const handleInputChange = (e) => {
     const { name, value, type, checked } = e.target;
@@ -124,6 +139,11 @@ const App = () => {
     setLoading(true);
     setStatus('Initializing Neural Handshake...');
     setGeneratedImage(null);
+    setPreviews([]);
+    setMetadata(null);
+    setScrubberIndex(0);
+    setGlbData(null);
+    setViewMode('2d');
 
     // 30 Minute Timeout (User Requested) - Allows for Sync Backends
     const controller = new AbortController();
@@ -142,15 +162,18 @@ const App = () => {
 
       // 1. Initial Handshake
       let response;
+      const headers = { 'Content-Type': 'application/json' };
+      if (hfToken) headers['Authorization'] = `Bearer ${hfToken}`;
+
       try {
         response = await fetch(`${cleanUrl}/generate`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${hfToken}` },
+          headers: headers,
           body: JSON.stringify(payload),
           signal: controller.signal
         });
       } catch (e) {
-        if (e.name === 'AbortError') throw new Error("Connection Timeout: Your Python Backend might be running synchronously. Please update it to the Async version.");
+        if (e.name === 'AbortError') throw new Error("Connection Timeout: Backend taking too long to respond.");
         throw e;
       } finally {
         clearTimeout(timeoutId);
@@ -184,13 +207,15 @@ const App = () => {
         attempts++;
 
         try {
-          const pollResponse = await fetch(`${cleanUrl}/task/${task_id}`, { headers: { 'Authorization': `Bearer ${hfToken}` } });
+          const pollHeaders = {};
+          if (hfToken) pollHeaders['Authorization'] = `Bearer ${hfToken}`;
+          const pollResponse = await fetch(`${cleanUrl}/task/${task_id}`, { headers: pollHeaders });
 
           if (!pollResponse.ok) {
             // If 404/500, count as error but don't stop immediately
             consecutiveErrors++;
             setStatus(`Network/Server Issue (${pollResponse.status}). Retrying...`);
-            if (consecutiveErrors > 5) throw new Error("Connection Lost: Server stopped responding (404/500).");
+            if (consecutiveErrors > 5) throw new Error("Connection lost or task expired. Please try again.");
             continue;
           }
 
@@ -198,11 +223,22 @@ const App = () => {
           consecutiveErrors = 0; // Reset error count on success
 
           if (taskData.status === 'completed') {
-            setGeneratedImage(`data:image/png;base64,${taskData.image_base64}`);
+            setGeneratedImage(`data:image/png;base64,${taskData.image_base64 || taskData.image_2d}`);
+            setPreviews(taskData.previews || []);
+            setMetadata(taskData.metadata || null);
+            // Store GLB data for 3D viewer
+            if (taskData.glb_b64) {
+              setGlbData(taskData.glb_b64);
+              console.log('✅ GLB data received:', taskData.glb_b64.length, 'bytes');
+            }
             setStatus(`Blueprint Materialized (${attempts * 10}s)`);
             break;
           } else if (taskData.status === 'failed') {
-            throw new Error(taskData.error || 'Latent Space Collapse');
+            throw new Error(taskData.error || 'Generation failed');
+          } else if (taskData.status === 'generating_3d_pro') {
+            // Intermediate 2D result might be available
+            if (taskData.image_base64) setGeneratedImage(`data:image/png;base64,${taskData.image_base64}`);
+            setStatus(`TRELLIS Engine Active: Extruding Voxels (${attempts * 10}s)...`);
           } else {
             setStatus(`Diffusion Active: ${attempts * 10}s elapsed...`);
           }
@@ -210,7 +246,7 @@ const App = () => {
           console.warn(e);
           consecutiveErrors++;
           setStatus(`Connection Unstable. Retrying (${consecutiveErrors}/5)...`);
-          if (consecutiveErrors > 5) throw new Error("Connection Lost: Check your Ngrok tunnel.");
+          if (consecutiveErrors > 5) throw new Error("Connection Failure: Check Modal Logs or your internet connection.");
         }
       }
       if (attempts >= maxAttempts) throw new Error("Temporal Timeout: Generation took longer than 60 minutes.");
@@ -235,6 +271,25 @@ const App = () => {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+  };
+
+  const downloadGLB = () => {
+    if (!glbData) return;
+    // Convert base64 to blob and download
+    const binaryString = atob(glbData);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    const blob = new Blob([bytes], { type: 'model/gltf-binary' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = "vastu_plan_3d_model.glb";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   };
 
   return (
@@ -325,7 +380,7 @@ const App = () => {
                 <div className="glass-panel rounded-3xl overflow-hidden flex flex-col h-[750px] border-t border-white/10 shadow-2xl">
                   {/* Tabs */}
                   <div className="flex p-2 gap-1 bg-black/40 backdrop-blur-xl border-b border-white/5">
-                    {['site', 'vastu', 'program', 'reference'].map((tab) => (
+                    {['site', 'vastu', 'program', 'reference', '3D Config'].map((tab) => (
                       <button
                         key={tab}
                         onClick={() => setActiveTab(tab)}
@@ -437,6 +492,62 @@ const App = () => {
                             </div>
                           </>
                         )}
+                        {activeTab === '3D Config' && (
+                          <>
+                            <div className="p-4 rounded-xl border border-indigo-500/30 bg-indigo-500/5 space-y-4">
+                              <SelectGroup label="Voxel Resolution" name="resolution" val={formData.resolution} onChange={handleInputChange} opts={[512, 1024, 1536]} />
+
+                              <div className="space-y-2">
+                                <div className="flex justify-between text-[10px] uppercase font-bold tracking-wider">
+                                  <span className="text-indigo-300">Decimation (Faces)</span>
+                                  <span className="text-white font-mono">{formData.decimation.toLocaleString()}</span>
+                                </div>
+                                <input type="range" name="decimation" min="100000" max="500000" step="10000" value={formData.decimation} onChange={handleInputChange} className="w-full h-1 bg-white/10 rounded-full appearance-none cursor-pointer accent-indigo-500" />
+                              </div>
+
+                              <div className="grid grid-cols-2 gap-4">
+                                <InputGroup label="Seed" name="seed" val={formData.seed} onChange={handleInputChange} type="number" />
+                                <ToggleItem label="Rand Seed" name="randomize_seed" checked={formData.randomize_seed} onChange={handleInputChange} icon={<Sparkles className="w-3 h-3 text-yellow-400" />} />
+                              </div>
+                            </div>
+
+                            {/* Advanced Accordion Container */}
+                            <div className="space-y-2 overflow-y-auto max-h-[300px] pr-2 custom-scrollbar">
+                              {/* Stage 1 */}
+                              <div className="space-y-1">
+                                <label className="text-[9px] uppercase font-bold text-indigo-300/60 tracking-wider ml-1">Stage 1: Sparse Structure</label>
+                                <div className="grid grid-cols-2 gap-2 p-2 bg-white/5 rounded-lg border border-white/5">
+                                  <InputGroup label="Steps" name="ss_sampling_steps" val={formData.ss_sampling_steps} onChange={handleInputChange} type="number" />
+                                  <InputGroup label="Strength" name="ss_guidance_strength" val={formData.ss_guidance_strength} onChange={handleInputChange} type="number" step="0.1" />
+                                  <InputGroup label="Rescale" name="ss_guidance_rescale" val={formData.ss_guidance_rescale} onChange={handleInputChange} type="number" step="0.01" />
+                                  <InputGroup label="T" name="ss_rescale_t" val={formData.ss_rescale_t} onChange={handleInputChange} type="number" step="0.1" />
+                                </div>
+                              </div>
+
+                              {/* Stage 2 */}
+                              <div className="space-y-1">
+                                <label className="text-[9px] uppercase font-bold text-indigo-300/60 tracking-wider ml-1">Stage 2: Shape</label>
+                                <div className="grid grid-cols-2 gap-2 p-2 bg-white/5 rounded-lg border border-white/5">
+                                  <InputGroup label="Steps" name="shape_slat_sampling_steps" val={formData.shape_slat_sampling_steps} onChange={handleInputChange} type="number" />
+                                  <InputGroup label="Strength" name="shape_slat_guidance_strength" val={formData.shape_slat_guidance_strength} onChange={handleInputChange} type="number" step="0.1" />
+                                  <InputGroup label="Rescale" name="shape_slat_guidance_rescale" val={formData.shape_slat_guidance_rescale} onChange={handleInputChange} type="number" step="0.01" />
+                                  <InputGroup label="T" name="shape_slat_rescale_t" val={formData.shape_slat_rescale_t} onChange={handleInputChange} type="number" step="0.1" />
+                                </div>
+                              </div>
+
+                              {/* Stage 3 */}
+                              <div className="space-y-1">
+                                <label className="text-[9px] uppercase font-bold text-indigo-300/60 tracking-wider ml-1">Stage 3: Texture</label>
+                                <div className="grid grid-cols-2 gap-2 p-2 bg-white/5 rounded-lg border border-white/5">
+                                  <InputGroup label="Steps" name="tex_slat_sampling_steps" val={formData.tex_slat_sampling_steps} onChange={handleInputChange} type="number" />
+                                  <InputGroup label="Strength" name="tex_slat_guidance_strength" val={formData.tex_slat_guidance_strength} onChange={handleInputChange} type="number" step="0.1" />
+                                  <InputGroup label="Rescale" name="tex_slat_guidance_rescale" val={formData.tex_slat_guidance_rescale} onChange={handleInputChange} type="number" step="0.01" />
+                                  <InputGroup label="T" name="tex_slat_rescale_t" val={formData.tex_slat_rescale_t} onChange={handleInputChange} type="number" step="0.1" />
+                                </div>
+                              </div>
+                            </div>
+                          </>
+                        )}
                       </motion.div>
                     </AnimatePresence>
                   </div>
@@ -478,33 +589,152 @@ const App = () => {
                       <span className="text-[10px] font-mono text-emerald-400 tracking-[0.2em] uppercase">Viewport.01 // Live</span>
                     </div>
                     {generatedImage && (
-                      <button onClick={downloadImage} className="text-xs flex items-center gap-2 hover:text-white text-indigo-300 transition-colors bg-white/5 px-3 py-1 rounded-full border border-white/10 hover:bg-indigo-500/20">
-                        <Download className="w-3 h-3" /> EXPORT_PNG
-                      </button>
+                      <div className="flex items-center gap-2">
+                        {/* 2D/3D View Toggle */}
+                        {glbData && (
+                          <div className="flex bg-black/40 rounded-full border border-white/10 overflow-hidden">
+                            <button
+                              onClick={() => setViewMode('2d')}
+                              className={`text-xs px-3 py-1 transition-all ${viewMode === '2d' ? 'bg-indigo-500/30 text-indigo-300' : 'text-slate-500 hover:text-white'}`}
+                            >
+                              2D
+                            </button>
+                            <button
+                              onClick={() => setViewMode('3d')}
+                              className={`text-xs px-3 py-1 transition-all ${viewMode === '3d' ? 'bg-cyan-500/30 text-cyan-300' : 'text-slate-500 hover:text-white'}`}
+                            >
+                              3D
+                            </button>
+                          </div>
+                        )}
+                        {/* Color Picker */}
+                        <div className="flex items-center gap-1 bg-white/5 px-2 py-1 rounded-full border border-white/10">
+                          <span className="text-[9px] text-slate-400 uppercase tracking-wider">Color</span>
+                          <input
+                            type="color"
+                            value={modelColor}
+                            onChange={(e) => setModelColor(e.target.value)}
+                            className="w-6 h-6 rounded-full cursor-pointer border-0 bg-transparent"
+                            style={{ WebkitAppearance: 'none' }}
+                          />
+                          <div className="flex gap-1">
+                            {['#7799bb', '#4f46e5', '#22c55e', '#f97316', '#ef4444', '#a855f7'].map(color => (
+                              <button
+                                key={color}
+                                onClick={() => setModelColor(color)}
+                                className={`w-4 h-4 rounded-full border-2 transition-all hover:scale-110 ${modelColor === color ? 'border-white scale-110' : 'border-transparent'}`}
+                                style={{ backgroundColor: color }}
+                              />
+                            ))}
+                          </div>
+                        </div>
+                        {/* Render Mode Toggle */}
+                        <button
+                          onClick={() => setRenderMode(m => m === 'normal' ? 'clay' : m === 'clay' ? 'wireframe' : 'normal')}
+                          className={`text-xs px-3 py-1 rounded-full border transition-all ${
+                            renderMode === 'clay' ? 'bg-orange-500/20 text-orange-300 border-orange-500/50' : 
+                            renderMode === 'wireframe' ? 'bg-purple-500/20 text-purple-300 border-purple-500/50' :
+                            'bg-white/5 text-slate-400 border-white/10 hover:text-white'
+                          }`}
+                        >
+                          {renderMode === 'clay' ? '● CLAY' : renderMode === 'wireframe' ? '◇ WIRE' : '○ NORMAL'}
+                        </button>
+                        {/* Export Buttons */}
+                        <button onClick={downloadImage} className="text-xs flex items-center gap-2 hover:text-white text-indigo-300 transition-colors bg-white/5 px-3 py-1 rounded-full border border-white/10 hover:bg-indigo-500/20">
+                          <Download className="w-3 h-3" /> PNG
+                        </button>
+                        {glbData && (
+                          <button onClick={downloadGLB} className="text-xs flex items-center gap-2 hover:text-white text-cyan-300 transition-colors bg-cyan-500/10 px-3 py-1 rounded-full border border-cyan-500/30 hover:bg-cyan-500/20">
+                            <Box className="w-3 h-3" /> GLB
+                          </button>
+                        )}
+                      </div>
                     )}
                   </div>
 
-                  {/* Viewport content same as before ... */}
-                  <div className="flex-1 flex items-center justify-center relative bg-black/30 p-8 overflow-hidden">
+                  {/* Viewport content */}
+                  <div className="flex-1 flex items-center justify-center relative bg-black/30 overflow-hidden">
+                    {/* Background Grid */}
                     <div className="absolute inset-0 z-0 perspective-1000 opacity-30">
                       <div className="absolute inset-0 bg-[linear-gradient(rgba(129,140,248,0.1)_1px,transparent_1px),linear-gradient(90deg,rgba(129,140,248,0.1)_1px,transparent_1px)] bg-[size:40px_40px] [transform:rotateX(60deg)_translateZ(-200px)] animate-[pan_20s_linear_infinite]"></div>
                     </div>
+                    
                     <AnimatePresence mode="popLayout">
-                      {/* ... (Previous Logic for Image/Placeholder) ... */}
                       {generatedImage ? (
                         <motion.div
-                          key="image"
+                          key="content"
                           initial={{ scale: 0.5, opacity: 0, rotateX: 45 }}
                           animate={{ scale: 1, opacity: 1, rotateX: 0 }}
-                          className="relative z-10 p-2 bg-white/5 rounded-xl border border-white/10 backdrop-blur-sm"
+                          className="relative z-10 w-full h-full flex items-center justify-center"
                         >
-                          <img src={generatedImage} className="relative rounded-lg shadow-2xl max-h-[600px] border border-white/10" alt="Blueprint" />
-                          <motion.div
-                            initial={{ top: 0 }}
-                            animate={{ top: "100%" }}
-                            transition={{ repeat: Infinity, duration: 2, ease: "linear" }}
-                            className="absolute left-0 right-0 h-1 bg-cyan-400/50 shadow-[0_0_20px_#22d3ee] z-20"
-                          />
+                          {/* 3D Interactive Model View */}
+                          {viewMode === '3d' && glbData ? (
+                            <div className="w-full h-full">
+                              <ModelViewer 
+                                glbBase64={glbData} 
+                                renderMode={renderMode}
+                                modelColor={modelColor}
+                                autoRotate={false}
+                                showGrid={true}
+                                backgroundColor="#0a0a0f"
+                              />
+                            </div>
+                          ) : (
+                            /* 2D Preview Image View */
+                            <div className="relative p-2 bg-white/5 rounded-xl border border-white/10 backdrop-blur-sm">
+                              <img
+                                src={previews.length > 0 && scrubberIndex < previews.length 
+                                  ? `data:image/png;base64,${previews[scrubberIndex]}` 
+                                  : generatedImage}
+                                className={`relative rounded-lg shadow-2xl max-h-[550px] border border-white/10 transition-all duration-200 ${
+                                  renderMode === 'clay' ? 'grayscale contrast-125 brightness-110 sepia-[0.2]' : ''
+                                }`}
+                                alt="Blueprint"
+                              />
+                              <motion.div
+                                initial={{ top: 0 }}
+                                animate={{ top: "100%" }}
+                                transition={{ repeat: Infinity, duration: 2, ease: "linear" }}
+                                className="absolute left-0 right-0 h-1 bg-cyan-400/50 shadow-[0_0_20px_#22d3ee] z-20 pointer-events-none"
+                              />
+                            </div>
+                          )}
+
+                          {/* Optical Scrubber - only show in 2D mode with previews */}
+                          {viewMode === '2d' && previews.length > 1 && (
+                            <div className="absolute bottom-6 left-1/2 -translate-x-1/2 w-72 bg-black/70 backdrop-blur-md p-3 rounded-xl border border-white/10 flex flex-col items-center gap-2 z-30">
+                              <div className="flex items-center justify-between w-full">
+                                <span className="text-[9px] uppercase tracking-widest text-cyan-400 font-bold">Optical Scrubber</span>
+                                <span className="text-[9px] font-mono text-white/50">{scrubberIndex + 1} / {previews.length}</span>
+                              </div>
+                              <input
+                                type="range" 
+                                min="0" 
+                                max={previews.length - 1} 
+                                step="1"
+                                value={scrubberIndex} 
+                                onChange={(e) => setScrubberIndex(parseInt(e.target.value))}
+                                className="w-full h-2 bg-white/20 rounded-full appearance-none cursor-ew-resize accent-cyan-400"
+                              />
+                            </div>
+                          )}
+
+                          {/* 3D Mode Hint */}
+                          {viewMode === '3d' && glbData && (
+                            <div className="absolute top-4 left-4 text-[9px] text-cyan-400/70 font-mono uppercase tracking-wider bg-black/50 px-3 py-1 rounded-lg border border-cyan-500/20">
+                              🖱️ Interactive 3D Model - Drag to rotate, scroll to zoom
+                            </div>
+                          )}
+
+                          {/* Show "3D Available" badge when in 2D mode but GLB exists */}
+                          {viewMode === '2d' && glbData && (
+                            <button 
+                              onClick={() => setViewMode('3d')}
+                              className="absolute top-4 right-4 text-[10px] text-cyan-300 font-mono uppercase tracking-wider bg-cyan-500/20 px-3 py-2 rounded-lg border border-cyan-500/30 hover:bg-cyan-500/30 transition-all animate-pulse"
+                            >
+                              ✨ 3D Model Ready - Click to View
+                            </button>
+                          )}
                         </motion.div>
                       ) : (
                         <motion.div
@@ -560,7 +790,21 @@ const App = () => {
               </Tilt>
             </motion.div>
 
+            {/* Visualization Panel */}
+            {/* ... */}
           </div>
+
+          {/* Post-Processing Console */}
+          {metadata && (
+            <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="mt-4 p-2 bg-black/80 border-t border-white/10 font-mono text-[10px] text-green-400/80 flex gap-6 justify-center uppercase tracking-widest">
+              <span>[MESH_FACES: {metadata.faces?.toLocaleString()}]</span>
+              <span>[VOXEL_RES: {metadata.voxel_res}]</span>
+              <span>[RENDER_TIME: 142ms]</span>
+              <span>[GPU_MEM: 18.4GB]</span>
+              <span>[SEED: {formData.seed}]</span>
+            </motion.div>
+          )}
+
         </motion.div>
       )}
     </div>
@@ -569,11 +813,11 @@ const App = () => {
 
 // --- Updated Styling Components (Copied from previous step to ensure file completeness) ---
 
-const InputGroup = ({ label, name, val, onChange, type = "text" }) => (
+const InputGroup = ({ label, name, val, onChange, type = "text", step = "any" }) => (
   <div className="space-y-1">
     <label className="text-[9px] uppercase font-bold text-indigo-300/60 tracking-wider ml-1">{label}</label>
     <input
-      type={type} name={name} value={val} onChange={onChange}
+      type={type} name={name} value={val} onChange={onChange} step={step}
       className="w-full glass-input px-3 py-2 rounded-lg text-sm placeholder-white/10 font-mono bg-black/20 border-white/5 focus:border-indigo-500/50 focus:bg-indigo-900/10 transition-all text-white"
     />
   </div>

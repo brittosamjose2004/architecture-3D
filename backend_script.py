@@ -1,227 +1,238 @@
 
 # ==========================================
-# PASTE THIS ENTIRE SCRIPT INTO COLAB/KAGGLE
+# VASTUPLAN.AI - COLAB BACKEND (Free Tier Optimized)
 # ==========================================
+# Run this entire block in Google Colab
 
+# 0. SET CACHE TO D: DRIVE (Prevents filling up C: drive)
+import os
+os.environ["HF_HOME"] = "D:\\huggingface_cache"
+os.environ["HUGGINGFACE_HUB_CACHE"] = "D:\\huggingface_cache\\hub"
+os.environ["TRANSFORMERS_CACHE"] = "D:\\huggingface_cache\\transformers"
+
+# 1. INSTALL DEPENDENCIES
+import subprocess, sys
+def install_dependencies():
+    print("⏳ Installing Dependencies (this takes 2-3 mins)...")
+    pkgs = [
+        "fastapi", "uvicorn", "pydantic", "torch", "requests",
+        "diffusers>=0.29.0", "transformers>=4.42.0",
+        "accelerate>=0.30.0", "bitsandbytes>=0.43.1",
+        "peft>=0.11.0", "python-multipart", "huggingface_hub",
+        "sentencepiece", "nest_asyncio"
+    ]
+    subprocess.check_call([sys.executable, "-m", "pip", "install"] + pkgs)
+    
+    # Fix for Colab bitsandbytes
+    if os.path.exists("/usr/local/cuda/lib64"):
+        os.environ["LD_LIBRARY_PATH"] += ":/usr/local/cuda/lib64"
+    os.environ["BITSANDBYTES_NOWELCOME"] = "1"
+
+try:
+    import diffusers
+except ImportError:
+    install_dependencies()
+
+# 2. IMPORTS & SETUP
 import uvicorn
+import nest_asyncio
+import time, re, shutil, io, uuid, base64, threading
+import torch
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
-import torch
-from diffusers import FluxPipeline
-import base64
-import io
-import uuid
-import nest_asyncio # Fix for Colab/Jupyter
+from huggingface_hub import login
+from transformers import BitsAndBytesConfig
+from diffusers import FluxPipeline, FluxTransformer2DModel
 
-# Apply Nest Asyncio to allow uvicorn to run in Colab
 nest_asyncio.apply()
-import threading
-import time
 
-# --- 1. SETUP MODELS ---
-print("Loading FLUX.1 Model... (This may take a minute)")
+# Check CUDA availability
+CUDA_AVAILABLE = torch.cuda.is_available()
+print(f"🖥️  CUDA Available: {CUDA_AVAILABLE}")
+if CUDA_AVAILABLE:
+    print(f"   GPU: {torch.cuda.get_device_name(0)}")
+    print(f"   VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+else:
+    print("⚠️  No CUDA GPU detected!")
+    print("   This script requires an NVIDIA GPU with CUDA support.")
+    print("   Options:")
+    print("   1. Use Google Colab with T4 GPU (free)")
+    print("   2. Use Modal deployment (modal_deploy.py)")
+    print("   3. Install CUDA drivers if you have an NVIDIA GPU")
+
+# 3. LOAD MODEL (4-BIT QUANTIZED)
+print("🔄 Initializing Model Pipeline...")
+
+# Load HF_TOKEN from environment variable (set in .env file or system)
+HF_TOKEN = os.environ.get("HF_TOKEN")  # Load from environment
+if not HF_TOKEN:
+    print("⚠️  WARNING: Please set HF_TOKEN in your .env file or environment!")
+    print("   Get your token at: https://huggingface.co/settings/tokens")
+else:
+    login(token=HF_TOKEN)
+
+pipe = None  # Initialize as None for non-GPU fallback
+
 try:
-    # Adjust model ID if you are using a different one
-    flux_pipe = FluxPipeline.from_pretrained(
-        "black-forest-labs/FLUX.1-dev", 
+    if not CUDA_AVAILABLE:
+        raise RuntimeError("CUDA not available - skipping model loading")
+    
+    # 4-bit Config
+    nf4_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+    )
+    
+    model_id = "black-forest-labs/FLUX.1-Kontext-dev"
+
+    print("📦 Loading Transformer (4-bit)...")
+    transformer = FluxTransformer2DModel.from_pretrained(
+        model_id, 
+        subfolder="transformer", 
+        quantization_config=nf4_config, 
         torch_dtype=torch.bfloat16
     )
-    flux_pipe.enable_model_cpu_offload() # Saves VRAM
+
+    print("🔗 Assembling Pipeline...")
+    pipe = FluxPipeline.from_pretrained(
+        model_id, 
+        transformer=transformer,
+        torch_dtype=torch.bfloat16
+    )
+    
+    pipe.enable_model_cpu_offload()
+    print("✅ Model Ready!")
 except Exception as e:
-    print(f"Error loading model: {e}")
-    print("Ensure you have logged in with huggingface-cli login or provided a token.")
+    print(f"❌ Error loading model: {e}")
+    print("Tip: Make sure you are using a GPU Runtime (Runtime > Change runtime type > T4 GPU)")
 
-# --- 2. DATA MODELS ---
-class PlanRequest(BaseModel):
-    plot_width: float
-    plot_length: float
-    setback_front: float
-    setback_sides: float
-    orientation: str
-    road_width: float
-    floors: str
-    entrance_loc: str
-    pooja_type: str
-    kitchen_corner: bool
-    master_corner: bool
-    bhk: str
-    family_type: str
-    dining_style: str
-    has_utility: bool
-    has_veranda: bool
-    style: str
-    steps: int
-    guidance: float
-    mode: str
-    ref_image_base64: Optional[str] = None # Expecting raw base64 string, no data URI prefix
-
-# --- 3. STATE MANAGEMENT ---
+# 4. API SETUP
 app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+TASKS = {}
 
-# IMPORTANT: Enable CORS for React App
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+class PlanRequest(BaseModel):
+    plot_width: float = 30.0
+    plot_length: float = 40.0
+    setback_front: float = 5.0
+    setback_sides: float = 3.0
+    orientation: str = "East"
+    road_width: float = 30.0
+    floors: str = "Ground Floor Only"
+    entrance_loc: str = "North-East (Highly Preferred)"
+    pooja_type: str = "Separate Room"
+    kitchen_corner: bool = True
+    master_corner: bool = True
+    bhk: str = "2 BHK"
+    family_type: str = "Nuclear Family"
+    dining_style: str = "Central Heart (Connecting Kitchen/Living)"
+    has_utility: bool = True
+    has_veranda: bool = True
+    style: str = "Modern Indian"
+    steps: int = 25
+    guidance: float = 3.5
+    mode: str = "Text Only"
+    ref_image_base64: Optional[str] = None 
 
-# In-Memory Task Store
-# Format: { "task_id": { "status": "processing" | "completed" | "failed", "image_base64": "...", "error": "..." } }
-TASKS = {} 
-
-def generate_plan_task(task_id: str, req: PlanRequest):
-    """
-    Background worker function that runs the AI model.
-    """
-    print(f"[{task_id}] Starting generation...")
+def run_generation(task_id: str, req: PlanRequest):
+    global pipe
+    print(f"[{task_id}] Processing...")
     try:
+        # Check if model is loaded
+        if pipe is None:
+            raise RuntimeError("Model not loaded. GPU required for local generation. Use Modal deployment instead.")
+        
         # Construct Prompt
+        vastu_constraints = []
+        if req.entrance_loc: vastu_constraints.append(f"MAIN ENTRANCE: {req.entrance_loc}")
+        if req.kitchen_corner: vastu_constraints.append("KITCHEN: South-East (Agni)")
+        if req.master_corner: vastu_constraints.append("MASTER BEDROOM: South-West (Nairutya)")
+        if req.pooja_type != "None": vastu_constraints.append(f"POOJA ROOM: {req.pooja_type}")
+
+        features = []
+        if req.has_utility: features.append("UTILITY AREA")
+        if req.has_veranda: features.append("TRADITIONAL THINNAI/VERANDA")
+
         prompt = (
-            f"A professional architectural floor plan: {req.style} style, {req.bhk}, "
-            f"Plot {req.plot_width}x{req.plot_length} ft, Facing {req.orientation}. "
-            f"Vastu: Entrance {req.entrance_loc}, Pooja {req.pooja_type}. "
-            f"Kitchen SE: {req.kitchen_corner}, Master SW: {req.master_corner}. "
-            f"High contrast blueprint, technical drawing, white lines on blue background."
+            f"Professional 2D CAD architectural floorplan for a {req.style} {req.floors}. "
+            f"PLOT: {req.plot_width}x{req.plot_length}ft, {req.orientation} facing. "
+            f"SETBACKS: Front {req.setback_front}ft, sides {req.setback_sides}ft. "
+            f"VASTU: {', '.join(vastu_constraints)}. PROGRAM: {req.bhk}. "
+            f"FEATURES: {', '.join(features)}. DINING: {req.dining_style}. "
+            "Technical orthographic view, architectural drafting style, high-contrast, labeled rooms."
         )
 
-        # Handle Reference Image (Img2Img) if provided
-        image_input = None
-        if req.ref_image_base64 and "Image" in req.mode:
-            try:
-                img_data = base64.b64decode(req.ref_image_base64)
-                # You would load this into PIL here if acting as control/ref image
-                # image_input = Image.open(io.BytesIO(img_data)).convert("RGB")
-                print(f"[{task_id}] Reference image received (Logic TBD based on pipeline support)")
-            except Exception as e:
-                print(f"[{task_id}] Image decode warning: {e}")
-
-        # --- GENERATION STEP ---
-        # Note: Actual inputs depend on your specific pipeline (txt2img vs img2img)
-        # using standard txt2img for demo stability
-        image = flux_pipe(
-            prompt,
-            height=768, # Optimize for your VRAM
-            width=1024,
+        image = pipe(
+            prompt, 
+            num_inference_steps=req.steps, 
             guidance_scale=req.guidance,
-            num_inference_steps=req.steps,
             max_sequence_length=512,
-            generator=torch.Generator("cpu").manual_seed(42)
+            height=768,
+            width=1024
         ).images[0]
 
-        # Convert to Base64
         buffered = io.BytesIO()
         image.save(buffered, format="PNG")
         img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-
-        # Update Status
-        TASKS[task_id] = {
-            "status": "completed",
-            "image_base64": img_str
-        }
-        print(f"[{task_id}] Completed successfully.")
-
+        TASKS[task_id] = {"status": "completed", "image_base64": img_str}
+        print(f"[{task_id}] Done.")
     except Exception as e:
-        print(f"[{task_id}] FAILED: {str(e)}")
-        TASKS[task_id] = {
-            "status": "failed",
-            "error": str(e)
-        }
+        TASKS[task_id] = {"status": "failed", "error": str(e)}
 
 @app.post("/generate")
 async def start_generation(req: PlanRequest, background_tasks: BackgroundTasks):
-    """
-    ASYNC ENDPOINT: Returns a task_id immediately.
-    """
     task_id = str(uuid.uuid4())
     TASKS[task_id] = {"status": "processing"}
-    
-    # Run generation in background so we don't block the request
-    background_tasks.add_task(generate_plan_task, task_id, req)
-    
-    return {"task_id": task_id, "message": "Generation started"}
+    background_tasks.add_task(run_generation, task_id, req)
+    return {"task_id": task_id}
 
 @app.get("/task/{task_id}")
-async def get_task_status(task_id: str):
-    """
-    POLLING ENDPOINT: React checks this every few seconds.
-    """
-    if task_id not in TASKS:
-        raise HTTPException(status_code=404, detail="Task not found")
-    
-    return TASKS[task_id]
+async def get_task_status(task_id: str): return TASKS.get(task_id, {"status": "failed"})
 
 @app.get("/")
-def home():
-    return {"status": "Online", "mode": "Async/Non-Blocking"}
+def root(): return {"message": "VastuPlan Colab Backend Online"}
 
-# --- 4. START SERVER & CLOUDFLARE ---
+# 5. START SERVER & CLOUDFLARE
 if __name__ == "__main__":
-    import subprocess
-    import time
-    import re
-    import shutil
-    import os
-
-    def start_cloudflare_tunnel(port):
-        """Downloads and starts Cloudflare Tunnel, returning the public URL."""
-        print("-" * 60)
-        print("☁️  Setting up Cloudflare Tunnel (No Token Required)...")
+    import platform
+    
+    def start_tunnel():
+        is_windows = platform.system() == "Windows"
         
-        # 1. Download cloudflared if not present
-        if not os.path.exists("./cloudflared"):
-            print("🔽 Downloading cloudflared binary...")
-            subprocess.run(["wget", "-q", "-nc", "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64", "-O", "cloudflared"])
-            subprocess.run(["chmod", "+x", "cloudflared"])
-
-        # 2. Start the tunnel
-        print("🚀 Starting tunnel...")
-        # We need to capture stderr because that's where the URL is printed
-        process = subprocess.Popen(
-            ["./cloudflared", "tunnel", "--url", f"http://localhost:{port}"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-
-        # 3. Read logs to find the URL
-        time.sleep(2) # Give it a moment
-        cf_url = None
-        end_time = time.time() + 20 # Wait max 20 seconds for URL
-        
-        while time.time() < end_time:
-            line = process.stderr.readline()
-            if not line:
-                break
+        if is_windows:
+            cloudflared_exe = "cloudflared.exe"
+            download_url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
             
-            # Look for regex: https://[random].trycloudflare.com
-            match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', line)
-            if match:
-                cf_url = match.group(0)
-                break
-        
-        if cf_url:
-            print("=" * 60)
-            print(f"✅ PUBLIC API URL: {cf_url}")
-            print("👉 COPY THIS URL into your VastuPlan React App")
-            print("=" * 60)
+            if not os.path.exists(cloudflared_exe):
+                print("📥 Downloading cloudflared for Windows...")
+                import urllib.request
+                urllib.request.urlretrieve(download_url, cloudflared_exe)
+                print("✅ Downloaded cloudflared.exe")
+            
+            proc = subprocess.Popen([cloudflared_exe, "tunnel", "--url", "http://localhost:8000"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         else:
-            print("❌ Failed to grab Cloudflare URL. Check logs.")
+            # Linux / Colab
+            if not os.path.exists("./cloudflared"):
+                subprocess.run(["wget", "-q", "-nc", "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64", "-O", "cloudflared"])
+                subprocess.run(["chmod", "+x", "cloudflared"])
             
-        return process
+            proc = subprocess.Popen(["./cloudflared", "tunnel", "--url", "http://localhost:8000"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        
+        time.sleep(2)
+        end = time.time() + 20
+        while time.time() < end:
+            line = proc.stderr.readline()
+            if match := re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', line):
+                print(f"\n✅ PUBLIC URL: {match.group(0)}\n")
+                return proc
+        print("❌ Tunnel failed. Server still running at http://localhost:8000")
+        return proc
 
-    # Start Cloudflare
-    try:
-        cf_process = start_cloudflare_tunnel(8000)
-    except Exception as e:
-        print(f"Tunnel Error: {e}")
-
-    # Start FastAPI
-    try:
-        uvicorn.run(app, host="0.0.0.0", port=8000)
-    finally:
-        if 'cf_process' in locals():
-            cf_process.terminate()
+    cf_proc = start_tunnel()
+    try: uvicorn.run(app, host="0.0.0.0", port=8000)
+    finally: 
+        if cf_proc: cf_proc.terminate()
